@@ -58,6 +58,11 @@ func NewClient(uri, user, pw string) *Client {
 	return &Client{FixSlash(uri), make(http.Header), &http.Client{}, &NoAuth{user, pw}}
 }
 
+// NewClientWith creates a new instance of client with a given HTTP client
+func NewClientWith(uri string, client *http.Client) *Client {
+	return &Client{FixSlash(uri), make(http.Header), client, &NoAuth{"", ""}}
+}
+
 // SetHeader lets us set arbitrary headers for a given client
 func (c *Client) SetHeader(key, value string) {
 	c.headers.Add(key, value)
