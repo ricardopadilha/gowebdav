@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -57,7 +58,7 @@ func main() {
 
 	cmd := getCmd(*method)
 
-	if e := cmd(c, flag.Arg(0), flag.Arg(1)); e != nil {
+	if e := cmd(context.Background(), c, flag.Arg(0), flag.Arg(1)); e != nil {
 		fail(e)
 	}
 }
@@ -87,7 +88,7 @@ func getHome() string {
 	}
 }
 
-func getCmd(method string) func(c *d.Client, p0, p1 string) error {
+func getCmd(method string) func(ctx context.Context, c *d.Client, p0, p1 string) error {
 	switch strings.ToUpper(method) {
 	case "LS", "LIST", "PROPFIND":
 		return cmdLs
@@ -117,14 +118,14 @@ func getCmd(method string) func(c *d.Client, p0, p1 string) error {
 		return cmdPut
 
 	default:
-		return func(c *d.Client, p0, p1 string) (err error) {
+		return func(ctx context.Context, c *d.Client, p0, p1 string) (err error) {
 			return errors.New("Unsupported method: " + method)
 		}
 	}
 }
 
-func cmdLs(c *d.Client, p0, _ string) (err error) {
-	files, err := c.ReadDir(p0)
+func cmdLs(ctx context.Context, c *d.Client, p0, _ string) (err error) {
+	files, err := c.ReadDir(ctx, p0)
 	if err == nil {
 		fmt.Println(fmt.Sprintf("ReadDir: '%s' entries: %d ", p0, len(files)))
 		for _, f := range files {
@@ -134,21 +135,21 @@ func cmdLs(c *d.Client, p0, _ string) (err error) {
 	return
 }
 
-func cmdStat(c *d.Client, p0, _ string) (err error) {
-	file, err := c.Stat(p0)
+func cmdStat(ctx context.Context, c *d.Client, p0, _ string) (err error) {
+	file, err := c.Stat(ctx, p0)
 	if err == nil {
 		fmt.Println(file)
 	}
 	return
 }
 
-func cmdGet(c *d.Client, p0, p1 string) (err error) {
-	bytes, err := c.Read(p0)
+func cmdGet(ctx context.Context, c *d.Client, p0, p1 string) (err error) {
+	bytes, err := c.Read(ctx, p0)
 	if err == nil {
 		if p1 == "" {
 			p1 = filepath.Join(".", p0)
 		}
-		err = writeFile(p1, bytes, 0644)
+		err = writeFile(ctx, p1, bytes, 0644)
 		if err == nil {
 			fmt.Println(fmt.Sprintf("Written %d bytes to: %s", len(bytes), p1))
 		}
@@ -156,47 +157,47 @@ func cmdGet(c *d.Client, p0, p1 string) (err error) {
 	return
 }
 
-func cmdRm(c *d.Client, p0, _ string) (err error) {
-	if err = c.Remove(p0); err == nil {
+func cmdRm(ctx context.Context, c *d.Client, p0, _ string) (err error) {
+	if err = c.Remove(ctx, p0); err == nil {
 		fmt.Println("Remove: " + p0)
 	}
 	return
 }
 
-func cmdMkdir(c *d.Client, p0, _ string) (err error) {
-	if err = c.Mkdir(p0, 0755); err == nil {
+func cmdMkdir(ctx context.Context, c *d.Client, p0, _ string) (err error) {
+	if err = c.Mkdir(ctx, p0, 0755); err == nil {
 		fmt.Println("Mkdir: " + p0)
 	}
 	return
 }
 
-func cmdMkdirAll(c *d.Client, p0, _ string) (err error) {
-	if err = c.MkdirAll(p0, 0755); err == nil {
+func cmdMkdirAll(ctx context.Context, c *d.Client, p0, _ string) (err error) {
+	if err = c.MkdirAll(ctx, p0, 0755); err == nil {
 		fmt.Println("MkdirAll: " + p0)
 	}
 	return
 }
 
-func cmdMv(c *d.Client, p0, p1 string) (err error) {
-	if err = c.Rename(p0, p1, true); err == nil {
+func cmdMv(ctx context.Context, c *d.Client, p0, p1 string) (err error) {
+	if err = c.Rename(ctx, p0, p1, true); err == nil {
 		fmt.Println("Rename: " + p0 + " -> " + p1)
 	}
 	return
 }
 
-func cmdCp(c *d.Client, p0, p1 string) (err error) {
-	if err = c.Copy(p0, p1, true); err == nil {
+func cmdCp(ctx context.Context, c *d.Client, p0, p1 string) (err error) {
+	if err = c.Copy(ctx, p0, p1, true); err == nil {
 		fmt.Println("Copy: " + p0 + " -> " + p1)
 	}
 	return
 }
 
-func cmdPut(c *d.Client, p0, p1 string) (err error) {
+func cmdPut(ctx context.Context, c *d.Client, p0, p1 string) (err error) {
 	if p1 == "" {
 		p1 = path.Join(".", p0)
 	} else {
 		var fi fs.FileInfo
-		fi, err = c.Stat(p0)
+		fi, err = c.Stat(ctx, p0)
 		if err != nil && !d.IsErrNotFound(err) {
 			return
 		}
@@ -211,13 +212,13 @@ func cmdPut(c *d.Client, p0, p1 string) (err error) {
 	}
 	defer stream.Close()
 
-	if err = c.WriteStream(p0, stream, 0644); err == nil {
+	if err = c.WriteStream(ctx, p0, stream, 0644); err == nil {
 		fmt.Println("Put: " + p1 + " -> " + p0)
 	}
 	return
 }
 
-func writeFile(path string, bytes []byte, mode os.FileMode) error {
+func writeFile(ctx context.Context, path string, bytes []byte, mode os.FileMode) error {
 	parent := filepath.Dir(path)
 	if _, e := os.Stat(parent); os.IsNotExist(e) {
 		if e := os.MkdirAll(parent, os.ModePerm); e != nil {
