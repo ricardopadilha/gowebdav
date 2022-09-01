@@ -4,18 +4,22 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	d "github.com/studio-b12/gowebdav"
 	"io"
+	"io/fs"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
+
+	d "github.com/studio-b12/gowebdav"
 )
 
 func main() {
 	root := flag.String("root", os.Getenv("ROOT"), "WebDAV Endpoint [ENV.ROOT]")
-	usr := flag.String("user", os.Getenv("USER"), "User [ENV.USER]")
-	pw := flag.String("pw", os.Getenv("PASSWORD"), "Password [ENV.PASSWORD]")
+	user := flag.String("user", os.Getenv("USER"), "User [ENV.USER]")
+	password := flag.String("pw", os.Getenv("PASSWORD"), "Password [ENV.PASSWORD]")
 	netrc := flag.String("netrc-file", filepath.Join(getHome(), ".netrc"), "read login from netrc file")
 	method := flag.String("X", "", `Method:
 	LS <PATH>
@@ -38,18 +42,18 @@ func main() {
 		fail("Set WebDAV ROOT")
 	}
 
-	if l := len(flag.Args()); l == 0 || l > 2 {
+	if argsLength := len(flag.Args()); argsLength == 0 || argsLength > 2 {
 		fail("Unsupported arguments")
 	}
 
-	if *pw == "" {
+	if *password == "" {
 		if u, p := d.ReadConfig(*root, *netrc); u != "" && p != "" {
-			usr = &u
-			pw = &p
+			user = &u
+			password = &p
 		}
 	}
 
-	c := d.NewClient(*root, *usr, *pw)
+	c := d.NewClient(*root, *user, *password)
 
 	cmd := getCmd(*method)
 
@@ -66,10 +70,21 @@ func fail(err interface{}) {
 }
 
 func getHome() string {
-	if u, e := user.Current(); e != nil {
+	u, e := user.Current()
+	if e != nil {
+		return os.Getenv("HOME")
+	}
+
+	if u != nil {
 		return u.HomeDir
 	}
-	return os.Getenv("HOME")
+
+	switch runtime.GOOS {
+	case "windows":
+		return ""
+	default:
+		return "~/"
+	}
 }
 
 func getCmd(method string) func(c *d.Client, p0, p1 string) error {
@@ -178,8 +193,18 @@ func cmdCp(c *d.Client, p0, p1 string) (err error) {
 
 func cmdPut(c *d.Client, p0, p1 string) (err error) {
 	if p1 == "" {
-		p1 = filepath.Join(".", p0)
+		p1 = path.Join(".", p0)
+	} else {
+		var fi fs.FileInfo
+		fi, err = c.Stat(p0)
+		if err != nil && !d.IsErrNotFound(err) {
+			return
+		}
+		if !d.IsErrNotFound(err) && fi.IsDir() {
+			p0 = path.Join(p0, p1)
+		}
 	}
+
 	stream, err := getStream(p1)
 	if err != nil {
 		return

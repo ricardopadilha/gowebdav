@@ -10,22 +10,34 @@ import (
 )
 
 func (c *Client) req(method, path string, body io.Reader, intercept func(*http.Request)) (req *http.Response, err error) {
-	// Tee the body, because if authorization fails we will need to read from it again.
 	var r *http.Request
-	var ba bytes.Buffer
-	bb := io.TeeReader(body, &ba)
+	var retryBuf io.Reader
 
-	if body == nil {
-		r, err = http.NewRequest(method, PathEscape(Join(c.root, path)), nil)
+	if body != nil {
+		// If the authorization fails, we will need to restart reading
+		// from the passed body stream.
+		// When body is seekable, use seek to reset the streams
+		// cursor to the start.
+		// Otherwise, copy the stream into a buffer while uploading
+		// and use the buffers content on retry.
+		if sk, ok := body.(io.Seeker); ok {
+			if _, err = sk.Seek(0, io.SeekStart); err != nil {
+				return
+			}
+			retryBuf = body
+		} else {
+			buff := &bytes.Buffer{}
+			retryBuf = buff
+			body = io.TeeReader(body, buff)
+		}
+		r, err = http.NewRequest(method, PathEscape(Join(c.root, path)), body)
 	} else {
-		r, err = http.NewRequest(method, PathEscape(Join(c.root, path)), bb)
+		r, err = http.NewRequest(method, PathEscape(Join(c.root, path)), nil)
 	}
 
 	if err != nil {
 		return nil, err
 	}
-
-	c.auth.Authorize(c, method, path)
 
 	for k, vals := range c.headers {
 		for _, v := range vals {
@@ -33,8 +45,20 @@ func (c *Client) req(method, path string, body io.Reader, intercept func(*http.R
 		}
 	}
 
+	// make sure we read 'c.auth' only once since it will be substituted below
+	// and that is unsafe to do when multiple goroutines are running at the same time.
+	c.authMutex.Lock()
+	auth := c.auth
+	c.authMutex.Unlock()
+
+	auth.Authorize(r, method, path)
+
 	if intercept != nil {
 		intercept(r)
+	}
+
+	if c.interceptor != nil {
+		c.interceptor(method, r)
 	}
 
 	rs, err := c.c.Do(r)
@@ -42,26 +66,24 @@ func (c *Client) req(method, path string, body io.Reader, intercept func(*http.R
 		return nil, err
 	}
 
-	if rs.StatusCode == 401 && c.auth.Type() == "NoAuth" {
-
+	if rs.StatusCode == 401 && auth.Type() == "NoAuth" {
 		wwwAuthenticateHeader := strings.ToLower(rs.Header.Get("Www-Authenticate"))
 
 		if strings.Index(wwwAuthenticateHeader, "digest") > -1 {
-			c.auth = &DigestAuth{c.auth.User(), c.auth.Pass(), digestParts(rs)}
-
+			c.authMutex.Lock()
+			c.auth = &DigestAuth{auth.User(), auth.Pass(), digestParts(rs)}
+			c.authMutex.Unlock()
 		} else if strings.Index(wwwAuthenticateHeader, "basic") > -1 {
-			c.auth = &BasicAuth{c.auth.User(), c.auth.Pass()}
-
+			c.authMutex.Lock()
+			c.auth = &BasicAuth{auth.User(), auth.Pass()}
+			c.authMutex.Unlock()
 		} else {
 			return rs, newPathError("Authorize", c.root, rs.StatusCode)
 		}
 
-		if body == nil {
-			return c.req(method, path, nil, intercept)
-		} else {
-			return c.req(method, path, &ba, intercept)
-		}
-
+		// retryBuf will be nil if body was nil initially so no check
+		// for body == nil is required here.
+		return c.req(method, path, retryBuf, intercept)
 	} else if rs.StatusCode == 401 {
 		return rs, newPathError("Authorize", c.root, rs.StatusCode)
 	}
@@ -69,18 +91,19 @@ func (c *Client) req(method, path string, body io.Reader, intercept func(*http.R
 	return rs, err
 }
 
-func (c *Client) mkcol(path string) int {
+func (c *Client) mkcol(path string) (status int, err error) {
 	rs, err := c.req("MKCOL", path, nil, nil)
 	if err != nil {
-		return 400
+		return
 	}
 	defer rs.Body.Close()
 
-	if rs.StatusCode == 201 || rs.StatusCode == 405 {
-		return 201
+	status = rs.StatusCode
+	if status == 405 {
+		status = 201
 	}
 
-	return rs.StatusCode
+	return
 }
 
 func (c *Client) options(path string) (*http.Response, error) {
@@ -108,15 +131,24 @@ func (c *Client) propfind(path string, self bool, body string, resp interface{},
 	defer rs.Body.Close()
 
 	if rs.StatusCode != 207 {
-		return fmt.Errorf("%s - %s %s", rs.Status, "PROPFIND", path)
+		return newPathError("PROPFIND", path, rs.StatusCode)
 	}
 
 	return parseXML(rs.Body, resp, parse)
 }
 
-func (c *Client) doCopyMove(method string, oldpath string, newpath string, overwrite bool) (int, io.ReadCloser) {
+func (c *Client) doCopyMove(
+	method string,
+	oldpath string,
+	newpath string,
+	overwrite bool,
+) (
+	status int,
+	r io.ReadCloser,
+	err error,
+) {
 	rs, err := c.req(method, oldpath, nil, func(rq *http.Request) {
-		rq.Header.Add("Destination", Join(c.root, newpath))
+		rq.Header.Add("Destination", PathEscape(Join(c.root, newpath)))
 		if overwrite {
 			rq.Header.Add("Overwrite", "T")
 		} else {
@@ -124,14 +156,21 @@ func (c *Client) doCopyMove(method string, oldpath string, newpath string, overw
 		}
 	})
 	if err != nil {
-		return 400, nil
+		return
 	}
-	return rs.StatusCode, rs.Body
+	status = rs.StatusCode
+	r = rs.Body
+	return
 }
 
-func (c *Client) copymove(method string, oldpath string, newpath string, overwrite bool) error {
-	s, data := c.doCopyMove(method, oldpath, newpath, overwrite)
-	defer data.Close()
+func (c *Client) copymove(method string, oldpath string, newpath string, overwrite bool) (err error) {
+	s, data, err := c.doCopyMove(method, oldpath, newpath, overwrite)
+	if err != nil {
+		return
+	}
+	if data != nil {
+		defer data.Close()
+	}
 
 	switch s {
 	case 201, 204:
@@ -153,14 +192,15 @@ func (c *Client) copymove(method string, oldpath string, newpath string, overwri
 	return newPathError(method, oldpath, s)
 }
 
-func (c *Client) put(path string, stream io.Reader) int {
+func (c *Client) put(path string, stream io.Reader) (status int, err error) {
 	rs, err := c.req("PUT", path, stream, nil)
 	if err != nil {
-		return 400
+		return
 	}
 	defer rs.Body.Close()
 
-	return rs.StatusCode
+	status = rs.StatusCode
+	return
 }
 
 func (c *Client) createParentCollection(itemPath string) (err error) {

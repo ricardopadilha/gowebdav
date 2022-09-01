@@ -3,21 +3,26 @@ package gowebdav
 import (
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	pathpkg "path"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client defines our structure
 type Client struct {
-	root    string
-	headers http.Header
-	c       *http.Client
-	auth    Authenticator
+	root        string
+	headers     http.Header
+	interceptor func(method string, rq *http.Request)
+	c           *http.Client
+
+	authMutex sync.Mutex
+	auth      Authenticator
 }
 
 // Authenticator stub
@@ -25,7 +30,7 @@ type Authenticator interface {
 	Type() string
 	User() string
 	Pass() string
-	Authorize(*Client, string, string)
+	Authorize(*http.Request, string, string)
 }
 
 // NoAuth structure holds our credentials
@@ -50,12 +55,12 @@ func (n *NoAuth) Pass() string {
 }
 
 // Authorize the current request
-func (n *NoAuth) Authorize(c *Client, method string, path string) {
+func (n *NoAuth) Authorize(req *http.Request, method string, path string) {
 }
 
 // NewClient creates a new instance of client
 func NewClient(uri, user, pw string) *Client {
-	return &Client{FixSlash(uri), make(http.Header), &http.Client{}, &NoAuth{user, pw}}
+	return &Client{FixSlash(uri), make(http.Header), nil, &http.Client{}, sync.Mutex{}, &NoAuth{user, pw}}
 }
 
 // NewClientWith creates a new instance of client with a given HTTP client
@@ -66,6 +71,11 @@ func NewClientWith(uri string, client *http.Client) *Client {
 // SetHeader lets us set arbitrary headers for a given client
 func (c *Client) SetHeader(key, value string) {
 	c.headers.Add(key, value)
+}
+
+// SetInterceptor lets us set an arbitrary interceptor for a given client
+func (c *Client) SetInterceptor(interceptor func(method string, rq *http.Request)) {
+	c.interceptor = interceptor
 }
 
 // SetTimeout exposes the ability to set a time limit for requests
@@ -140,7 +150,7 @@ func (c *Client) ReadDir(path string) ([]os.FileInfo, error) {
 
 		if p := getProps(r, "200"); p != nil {
 			f := new(File)
-			if ps, err := url.QueryUnescape(r.Href); err == nil {
+			if ps, err := url.PathUnescape(r.Href); err == nil {
 				f.name = pathpkg.Base(ps)
 			} else {
 				f.name = p.Name
@@ -264,9 +274,12 @@ func (c *Client) RemoveAll(path string) error {
 }
 
 // Mkdir makes a directory
-func (c *Client) Mkdir(path string, _ os.FileMode) error {
+func (c *Client) Mkdir(path string, _ os.FileMode) (err error) {
 	path = FixSlashes(path)
-	status := c.mkcol(path)
+	status, err := c.mkcol(path)
+	if err != nil {
+		return
+	}
 	if status == 201 {
 		return nil
 	}
@@ -275,12 +288,16 @@ func (c *Client) Mkdir(path string, _ os.FileMode) error {
 }
 
 // MkdirAll like mkdir -p, but for webdav
-func (c *Client) MkdirAll(path string, _ os.FileMode) error {
+func (c *Client) MkdirAll(path string, _ os.FileMode) (err error) {
 	path = FixSlashes(path)
-	status := c.mkcol(path)
+	status, err := c.mkcol(path)
+	if err != nil {
+		return
+	}
 	if status == 201 {
 		return nil
-	} else if status == 409 {
+	}
+	if status == 409 {
 		paths := strings.Split(path, "/")
 		sub := "/"
 		for _, e := range paths {
@@ -288,7 +305,10 @@ func (c *Client) MkdirAll(path string, _ os.FileMode) error {
 				continue
 			}
 			sub += e + "/"
-			status = c.mkcol(sub)
+			status, err = c.mkcol(sub)
+			if err != nil {
+				return
+			}
 			if status != 201 {
 				return newPathError("MkdirAll", sub, status)
 			}
@@ -342,23 +362,67 @@ func (c *Client) ReadStream(path string) (io.ReadCloser, error) {
 	return nil, newPathError("ReadStream", path, rs.StatusCode)
 }
 
+// ReadStreamRange reads the stream representing a subset of bytes for a given path,
+// utilizing HTTP Range Requests if the server supports it.
+// The range is expressed as offset from the start of the file and length, for example
+// offset=10, length=10 will return bytes 10 through 19.
+//
+// If the server does not support partial content requests and returns full content instead,
+// this function will emulate the behavior by skipping `offset` bytes and limiting the result
+// to `length`.
+func (c *Client) ReadStreamRange(path string, offset, length int64) (io.ReadCloser, error) {
+	rs, err := c.req("GET", path, nil, func(r *http.Request) {
+		r.Header.Add("Range", fmt.Sprintf("bytes=%v-%v", offset, offset+length-1))
+	})
+	if err != nil {
+		return nil, newPathErrorErr("ReadStreamRange", path, err)
+	}
+
+	if rs.StatusCode == http.StatusPartialContent {
+		// server supported partial content, return as-is.
+		return rs.Body, nil
+	}
+
+	// server returned success, but did not support partial content, so we have the whole
+	// stream in rs.Body
+	if rs.StatusCode == 200 {
+		// discard first 'offset' bytes.
+		if _, err := io.Copy(io.Discard, io.LimitReader(rs.Body, offset)); err != nil {
+			return nil, newPathErrorErr("ReadStreamRange", path, err)
+		}
+
+		// return a io.ReadCloser that is limited to `length` bytes.
+		return &limitedReadCloser{rs.Body, int(length)}, nil
+	}
+
+	rs.Body.Close()
+	return nil, newPathError("ReadStream", path, rs.StatusCode)
+}
+
 // Write writes data to a given path
-func (c *Client) Write(path string, data []byte, _ os.FileMode) error {
-	s := c.put(path, bytes.NewReader(data))
+func (c *Client) Write(path string, data []byte, _ os.FileMode) (err error) {
+	s, err := c.put(path, bytes.NewReader(data))
+	if err != nil {
+		return
+	}
+
 	switch s {
 
 	case 200, 201, 204:
 		return nil
 
 	case 409:
-		err := c.createParentCollection(path)
+		err = c.createParentCollection(path)
 		if err != nil {
-			return err
+			return
 		}
 
-		s = c.put(path, bytes.NewReader(data))
+		s, err = c.put(path, bytes.NewReader(data))
+		if err != nil {
+			return
+		}
 		if s == 200 || s == 201 || s == 204 {
-			return nil
+			return
 		}
 	}
 
@@ -366,14 +430,17 @@ func (c *Client) Write(path string, data []byte, _ os.FileMode) error {
 }
 
 // WriteStream writes a stream
-func (c *Client) WriteStream(path string, stream io.Reader, _ os.FileMode) error {
+func (c *Client) WriteStream(path string, stream io.Reader, _ os.FileMode) (err error) {
 
-	err := c.createParentCollection(path)
+	err = c.createParentCollection(path)
 	if err != nil {
 		return err
 	}
 
-	s := c.put(path, stream)
+	s, err := c.put(path, stream)
+	if err != nil {
+		return err
+	}
 
 	switch s {
 	case 200, 201, 204:
