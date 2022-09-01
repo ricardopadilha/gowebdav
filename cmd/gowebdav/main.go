@@ -127,7 +127,7 @@ func getCmd(method string) func(ctx context.Context, c *d.Client, p0, p1 string)
 func cmdLs(ctx context.Context, c *d.Client, p0, _ string) (err error) {
 	files, err := c.ReadDir(ctx, p0)
 	if err == nil {
-		fmt.Println(fmt.Sprintf("ReadDir: '%s' entries: %d ", p0, len(files)))
+		fmt.Printf("ReadDir: '%s' entries: %d\n", p0, len(files))
 		for _, f := range files {
 			fmt.Println(f)
 		}
@@ -151,7 +151,7 @@ func cmdGet(ctx context.Context, c *d.Client, p0, p1 string) (err error) {
 		}
 		err = writeFile(ctx, p1, bytes, 0644)
 		if err == nil {
-			fmt.Println(fmt.Sprintf("Written %d bytes to: %s", len(bytes), p1))
+			fmt.Printf("Written %d bytes to: %s\n", len(bytes), p1)
 		}
 	}
 	return
